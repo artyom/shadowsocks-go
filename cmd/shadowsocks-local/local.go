@@ -13,6 +13,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -159,6 +160,7 @@ type ServerCipher struct {
 }
 
 var servers struct {
+	best      int32 // index of server with lowest latency
 	srvCipher []*ServerCipher
 	failCnt   []int32 // failed connection count
 }
@@ -235,6 +237,13 @@ func parseServerConfig(config *ss.Config) {
 	for _, se := range servers.srvCipher {
 		log.Println("available remote server", se.server)
 	}
+	if l := len(servers.srvCipher); l > 1 {
+		hostList := make([]string, l)
+		for i, s := range servers.srvCipher {
+			hostList[i] = s.server
+		}
+		pickLowestLatency(hostList, &servers.best)
+	}
 	return
 }
 
@@ -254,11 +263,17 @@ func connectToServer(serverId int, rawaddr []byte, addr string) (remote *ss.Conn
 	return
 }
 
-// Connection to the server in the order specified in the config. On
+// Connect to the server with best observed latency if possible, if it's
+// unavailable, try servers in the order specified in the config. On
 // connection failure, try the next server. A failed server will be tried with
 // some probability according to its fail count, so we can discover recovered
 // servers.
 func createServerConn(rawaddr []byte, addr string) (remote *ss.Conn, err error) {
+	// try server with lowest observed latency first
+	remote, err = connectToServer(int(atomic.LoadInt32(&servers.best)), rawaddr, addr)
+	if err == nil {
+		return
+	}
 	const baseFailCnt = 20
 	n := len(servers.srvCipher)
 	skipped := make([]int, 0)
@@ -428,4 +443,44 @@ func main() {
 	parseServerConfig(config)
 
 	run(cmdLocal + ":" + strconv.Itoa(config.LocalPort))
+}
+
+// pickLowestLatency starts background goroutine that tries to connect to given
+// addresses in host:port format periodically and atomically updates idx with
+// index of host with lowest latency. Use returned function to stop background
+// goroutine.
+func pickLowestLatency(hosts []string, idx *int32) (cancel func()) {
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		t := time.NewTimer(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				var cand int
+				var bestTime time.Duration
+				for i, addr := range hosts {
+					begin := time.Now()
+					conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+					if err != nil {
+						continue
+					}
+					spent := time.Since(begin)
+					conn.Close()
+					if bestTime == 0 || spent < bestTime {
+						cand, bestTime = i, spent
+					}
+				}
+				if bestTime > 0 {
+					atomic.StoreInt32(idx, int32(cand))
+					debug.Printf("server %q (%d) has lowest latency: %v",
+						hosts[cand], cand, bestTime)
+				}
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
 }
