@@ -13,6 +13,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
@@ -159,7 +160,7 @@ type ServerCipher struct {
 
 var servers struct {
 	srvCipher []*ServerCipher
-	failCnt   []int // failed connection count
+	failCnt   []int32 // failed connection count
 }
 
 func parseServerConfig(config *ss.Config) {
@@ -230,7 +231,7 @@ func parseServerConfig(config *ss.Config) {
 			i++
 		}
 	}
-	servers.failCnt = make([]int, len(servers.srvCipher))
+	servers.failCnt = make([]int32, len(servers.srvCipher))
 	for _, se := range servers.srvCipher {
 		log.Println("available remote server", se.server)
 	}
@@ -243,13 +244,13 @@ func connectToServer(serverId int, rawaddr []byte, addr string) (remote *ss.Conn
 	if err != nil {
 		log.Println("error connecting to shadowsocks server:", err)
 		const maxFailCnt = 30
-		if servers.failCnt[serverId] < maxFailCnt {
-			servers.failCnt[serverId]++
+		if atomic.LoadInt32(&servers.failCnt[serverId]) < maxFailCnt {
+			atomic.AddInt32(&servers.failCnt[serverId], 1)
 		}
 		return nil, err
 	}
 	debug.Printf("connected to %s via %s\n", addr, se.server)
-	servers.failCnt[serverId] = 0
+	atomic.StoreInt32(&servers.failCnt[serverId], 0)
 	return
 }
 
@@ -263,7 +264,7 @@ func createServerConn(rawaddr []byte, addr string) (remote *ss.Conn, err error) 
 	skipped := make([]int, 0)
 	for i := 0; i < n; i++ {
 		// skip failed server, but try it with some probability
-		if servers.failCnt[i] > 0 && rand.Intn(servers.failCnt[i]+baseFailCnt) != 0 {
+		if cnt := atomic.LoadInt32(&servers.failCnt[i]); cnt > 0 && rand.Int31n(cnt+baseFailCnt) != 0 {
 			skipped = append(skipped, i)
 			continue
 		}
