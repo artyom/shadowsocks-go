@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 )
 
@@ -463,15 +466,16 @@ func pickLowestLatency(hosts []string, idx *int32) (cancel func()) {
 				var cand int
 				var bestTime time.Duration
 				for i, addr := range hosts {
-					begin := time.Now()
-					conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+					addr, _, err := net.SplitHostPort(addr)
 					if err != nil {
 						continue
 					}
-					spent := time.Since(begin)
-					conn.Close()
-					if bestTime == 0 || spent < bestTime {
-						cand, bestTime = i, spent
+					rtt, err := ping(addr)
+					if err != nil {
+						continue
+					}
+					if bestTime == 0 || rtt < bestTime {
+						cand, bestTime = i, rtt
 					}
 				}
 				if bestTime > 0 {
@@ -483,4 +487,47 @@ func pickLowestLatency(hosts []string, idx *int32) (cancel func()) {
 		}
 	}()
 	return func() { once.Do(func() { close(done) }) }
+}
+
+func ping(addr string) (time.Duration, error) {
+	dst := net.ParseIP(addr)
+	if dst == nil {
+		return 0, fmt.Errorf("%q is not a valid ip address", addr)
+	}
+	c, err := icmp.ListenPacket("udp4", "0.0.0.0")
+	if err != nil {
+		return 0, err
+	}
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	defer c.Close()
+
+	msg := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Body: &icmp.Echo{
+			ID: os.Getpid() & 0xffff, Seq: 1,
+			Data: []byte("ping"),
+		},
+	}
+	b, err := msg.Marshal(nil)
+	if err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 1500)
+	start := time.Now()
+	if _, err := c.WriteTo(b, &net.UDPAddr{IP: dst}); err != nil {
+		return 0, err
+	}
+	n, _, err := c.ReadFrom(buf)
+	if err != nil {
+		return 0, err
+	}
+	rtt := time.Since(start)
+	rm, err := icmp.ParseMessage(1, buf[:n])
+	if err != nil {
+		return 0, err
+	}
+	if rm.Type != ipv4.ICMPTypeEchoReply {
+		return 0, fmt.Errorf("got %+v; want echo reply", rm)
+	}
+	return rtt, nil
 }
