@@ -456,7 +456,7 @@ func pickLowestLatency(hosts []string, idx *int32) (cancel func()) {
 	done := make(chan struct{})
 	var once sync.Once
 	go func() {
-		t := time.NewTimer(time.Minute)
+		t := time.NewTicker(time.Minute)
 		defer t.Stop()
 		for {
 			select {
